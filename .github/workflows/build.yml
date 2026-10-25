@@ -1,3 +1,4 @@
+
 name: Build FavPic For Redmi
 
 on:
@@ -10,7 +11,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Set up Java
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
@@ -21,34 +25,56 @@ jobs:
         with:
           channel: 'stable'
 
-      - name: Create & Assemble FavPic
+      - name: Build FavPic APK
         run: |
-          # 1. Generate clean Flutter project
+          # 1. Create clean project
           flutter create --org com.favpic favpic
           cd favpic
 
           # 2. Add dependencies
-          flutter pub add http gal path_provider image_cropper receive_sharing_intent share_plus
+          flutter pub add http gal path_provider share_plus
 
-          # 3. Add Android permissions and Share Intent to AndroidManifest.xml
-          sed -i '/<application/i \    <uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>' android/app/src/main/AndroidManifest.xml
-          
-          sed -i '/<\/activity>/i \            <intent-filter>\n                <action android:name="android.intent.action.SEND" />\n                <category android:name="android.intent.category.DEFAULT" />\n                <data android:mimeType="text/plain" />\n            </intent-filter>' android/app/src/main/AndroidManifest.xml
+          # 3. Create bulletproof Android Manifest with Internet permissions
+          cat << 'EOF' > android/app/src/main/AndroidManifest.xml
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>
+              <application
+                  android:label="FavPic"
+                  android:name="${applicationName}"
+                  android:icon="@mipmap/ic_launcher">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:theme="@style/LaunchTheme"
+                      android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+                      android:hardwareAccelerated="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                  </activity>
+                  <meta-data
+                      android:name="flutterEmbedding"
+                      android:value="2" />
+              </application>
+          </manifest>
+          EOF
 
-          # 4. Inject FavPic Core Engine into main.dart
+          # 4. Generate Core Application Code
           cat << 'EOF' > lib/main.dart
-          import 'dart:async';
           import 'dart:io';
-          import 'dart:typed_data';
-          import 'dart:ui' as ui;
           import 'package:flutter/material.dart';
-          import 'package:flutter/services.dart';
           import 'package:gal/gal.dart';
           import 'package:http/http.dart' as http;
-          import 'package:image_cropper/image_cropper.dart';
           import 'package:path_provider/path_provider.dart';
-          import 'package:receive_sharing_intent/receive_sharing_intent.dart';
-          import 'package:share_plus/share_plus.dart';
 
           void main() {
             WidgetsFlutterBinding.ensureInitialized();
@@ -60,7 +86,7 @@ jobs:
             @override
             Widget build(BuildContext context) {
               return MaterialApp(
-                title: 'FavPic Ultra',
+                title: 'FavPic',
                 debugShowCheckedModeBanner: false,
                 theme: ThemeData.dark().copyWith(
                   scaffoldBackgroundColor: const Color(0xFF09090B),
@@ -79,51 +105,42 @@ jobs:
 
           class _HomeScreenState extends State<HomeScreen> {
             final TextEditingController _urlCtrl = TextEditingController();
-            StreamSubscription? _sub;
             List<String> _mediaUrls = [];
             int _index = 0;
             bool _loading = false;
-            String _status = '';
 
-            @override
-            void initState() {
-              super.initState();
-              _sub = ReceiveSharingIntent.instance.getMediaStream().listen((shared) {
-                if (shared.isNotEmpty && shared.first.path.isNotEmpty) {
-                  _urlCtrl.text = shared.first.path;
-                  _fetch(shared.first.path);
-                }
-              });
-              ReceiveSharingIntent.instance.getInitialMedia().then((shared) {
-                if (shared.isNotEmpty && shared.first.path.isNotEmpty) {
-                  _urlCtrl.text = shared.first.path;
-                  _fetch(shared.first.path);
-                }
-              });
-            }
-
-            Future<void> _fetch(String text) async {
-              final match = RegExp(r'(https?:\/\/[^\s]+)').firstMatch(text);
-              final url = match != null ? match.group(0)! : text.trim();
+            Future<void> _fetchMedia(String raw) async {
+              final match = RegExp(r'(https?:\/\/[^\s]+)').firstMatch(raw);
+              final url = match != null ? match.group(0)! : raw.trim();
               if (url.isEmpty) return;
 
+              FocusScope.of(context).unfocus();
               setState(() {
                 _loading = true;
-                _status = 'Extracting media...';
                 _mediaUrls = [];
+                _index = 0;
               });
 
               try {
                 if (url.contains('youtube.com') || url.contains('youtu.be')) {
                   final id = RegExp(r'(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})').firstMatch(url)?.group(1);
-                  _mediaUrls = ['https://img.youtube.com/vi/$id/maxresdefault.jpg'];
+                  if (id != null) {
+                    setState(() => _mediaUrls = ['https://img.youtube.com/vi/$id/maxresdefault.jpg']);
+                  }
                 } else {
                   final clean = url.split('?').first;
                   final res = await http.get(Uri.parse(clean), headers: {
                     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15'
-                  });
+                  }).timeout(const Duration(seconds: 8));
+
                   final matches = RegExp(r'<meta[^>]*property=["\']og:image["\'][^>]*content=["\']([^"\']+)["\']').allMatches(res.body);
-                  _mediaUrls = matches.map((m) => m.group(1)!.replaceAll('&amp;', '&')).toSet().toList();
+                  final urls = matches.map((m) => m.group(1)!.replaceAll('&amp;', '&')).toSet().toList();
+
+                  if (urls.isNotEmpty) {
+                    setState(() => _mediaUrls = urls);
+                  } else {
+                    throw Exception('Could not locate public photo. Ensure account/post is public.');
+                  }
                 }
               } catch (e) {
                 ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
@@ -132,15 +149,25 @@ jobs:
               }
             }
 
-            Future<void> _saveCurrent() async {
+            Future<void> _savePhoto() async {
               if (_mediaUrls.isEmpty) return;
               try {
+                final hasAccess = await Gal.hasAccess();
+                if (!hasAccess && !(await Gal.requestAccess())) {
+                  throw Exception('Permission Denied');
+                }
+
                 final res = await http.get(Uri.parse(_mediaUrls[_index]));
                 final dir = await getTemporaryDirectory();
                 final f = File('${dir.path}/favpic_${DateTime.now().millisecondsSinceEpoch}.jpg');
                 await f.writeAsBytes(res.bodyBytes);
+
                 await Gal.putImage(f.path, album: 'FavPic');
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Saved directly to Photos/Gallery!')));
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Saved directly to Photos/Gallery!'), backgroundColor: Colors.teal),
+                  );
+                }
               } catch (e) {
                 ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Save error: $e')));
               }
@@ -148,7 +175,6 @@ jobs:
 
             @override
             void dispose() {
-              _sub?.cancel();
               _urlCtrl.dispose();
               super.dispose();
             }
@@ -156,7 +182,7 @@ jobs:
             @override
             Widget build(BuildContext context) {
               return Scaffold(
-                appBar: AppBar(title: const Text('FavPic Ultra', style: TextStyle(fontWeight: FontWeight.bold))),
+                appBar: AppBar(title: const Text('FavPic', style: TextStyle(fontWeight: FontWeight.bold))),
                 body: Padding(
                   padding: const EdgeInsets.all(16.0),
                   child: Column(
@@ -176,15 +202,15 @@ jobs:
                         width: double.infinity,
                         height: 48,
                         child: FilledButton.icon(
-                          onPressed: _loading ? null : () => _fetch(_urlCtrl.text),
+                          onPressed: _loading ? null : () => _fetchMedia(_urlCtrl.text),
                           icon: const Icon(Icons.download, color: Colors.black),
                           label: const Text('Fetch Photo', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
                           style: FilledButton.styleFrom(backgroundColor: Colors.cyanAccent),
                         ),
                       ),
-                      if (_loading) const Padding(padding: EdgeInsets.all(20), child: CircularProgressIndicator(color: Colors.cyanAccent)),
+                      if (_loading) const Padding(padding: EdgeInsets.all(24), child: CircularProgressIndicator(color: Colors.cyanAccent)),
                       if (_mediaUrls.isNotEmpty && !_loading) ...[
-                        const SizedBox(height: 20),
+                        const SizedBox(height: 16),
                         Expanded(
                           child: ClipRRect(
                             borderRadius: BorderRadius.circular(16),
@@ -196,7 +222,7 @@ jobs:
                           width: double.infinity,
                           height: 48,
                           child: ElevatedButton.icon(
-                            onPressed: _saveCurrent,
+                            onPressed: _savePhoto,
                             icon: const Icon(Icons.save_alt),
                             label: const Text('Save to Gallery (FavPic Album)'),
                             style: ElevatedButton.styleFrom(backgroundColor: Colors.teal.shade700, foregroundColor: Colors.white),
@@ -211,7 +237,7 @@ jobs:
           }
           EOF
 
-          # 5. Build Release APK
+          # 5. Build Release APK cleanly
           flutter build apk --release
 
       - name: Deliver APK Artifact
